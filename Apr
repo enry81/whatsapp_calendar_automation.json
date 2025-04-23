@@ -1,0 +1,230 @@
+{
+  "name": "WhatsApp Calendar Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "webhook/whatsapp",
+        "responseMode": "onReceived"
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 100]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Deduplicate incoming WhatsApp messages by ID\nconst staticData = this.getWorkflowStaticData();\nif (!staticData.recentIds) staticData.recentIds = [];\nconst msg = $json[\"messages\"][0];\nconst id = msg.id;\nif (staticData.recentIds.includes(id)) return [];\nstaticData.recentIds.unshift(id);\nif (staticData.recentIds.length > 50) staticData.recentIds.pop();\nreturn items;"
+      },
+      "name": "Deduplication",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [400, 100]
+    },
+    {
+      "parameters": {
+        "functionCode": "return [{ json: { type: $json.messages[0].type, payload: $json.messages[0][ $json.messages[0].type ].id || $json.messages[0].text.body, from: $json.messages[0].from } }];"
+      },
+      "name": "Uniform Message",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [600, 100]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{$json[\"type\"]}}", "operation": "equal", "value2": "audio" }
+          ]
+        }
+      },
+      "name": "Audio vs Text?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [800, 100]
+    },
+    {
+      "parameters": {
+        "requestMethod": "POST",
+        "url": "https://YOUR_WHISPER_ENDPOINT/transcribe",
+        "jsonParameters": true,
+        "bodyParametersUi": {
+          "parameter": [
+            { "name": "audio_id", "value": "={{$json[\"payload\"]}}" }
+          ]
+        }
+      },
+      "name": "Transcribe Audio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1000, 50]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByIndex",
+        "keepOnlySet": false,
+        "joinCondition": "all"
+      },
+      "name": "Merge Transcription",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 1,
+      "position": [1200, 100]
+    },
+    {
+      "parameters": {
+        "values": [
+          { "name": "text", "value": "={{$json[\"transcript\"] || $json[\"payload\"]}}" },
+          { "name": "from", "value": "={{$json[\"from\"]}}" }
+        ]
+      },
+      "name": "Set Text",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [1400, 100]
+    },
+    {
+      "parameters": {
+        "requestMethod": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "jsonParameters": true,
+        "bodyParametersUi": {
+          "parameter": [
+            { "name": "model", "value": "gpt-3.5-turbo" },
+            {
+              "name": "messages",
+              "value": "=[\n  { \"role\": \"system\", \"content\": \"You are a helpful assistant that extracts scheduling commands.\" },\n  { \"role\": \"user\", \"content\": \"Extract action (add, edit, delete), title, date (YYYY-MM-DD), time (HH:mm), and eventId if any, from this text: {{$json[\\\"text\\\"]}}. Return only JSON.\" }\n]"
+            }
+          ]
+        }
+      },
+      "name": "Parse Command",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [1600, 100],
+      "credentials": { "httpRequest": { "name": "OpenAI" } }
+    },
+    {
+      "parameters": {
+        "functionCode": "// Validate parsed fields\nconst p = JSON.parse($json[\"choices\"][0].message.content);\nif (!p.date || !p.time || !p.action) throw new Error(\"Missing required fields: date, time or action\");\nreturn [{ json: p }];"
+      },
+      "name": "Validate",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1800, 100]
+    },
+    {
+      "parameters": {
+        "value": "={{$json[\"action\"]}}",
+        "rules": [
+          { "operation": "equal", "value": "add" },
+          { "operation": "equal", "value": "edit" },
+          { "operation": "equal", "value": "delete" }
+        ]
+      },
+      "name": "Choose Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [2000, 100]
+    },
+    {
+      "parameters": {
+        "calendarId": "primary",
+        "summary": "={{$json[\"title\"]}}",
+        "start": { "dateTime": "={{$json[\"date\"] + 'T' + $json[\"time\"] + ':00'}}" },
+        "end":   { "dateTime": "={{$moment($json[\"date\"] + 'T' + $json[\"time\"] + ':00').add(1,'hour').toISOString()}}"}
+      },
+      "name": "Create Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [2200, 0],
+      "credentials": { "googleCalendarOAuth2Api": { "name": "GoogleServiceAccount" } }
+    },
+    {
+      "parameters": {
+        "calendarId": "primary",
+        "filters": "summary = '{{$json[\"title\"]}}' AND startTime >= '{{$json[\"date\"]}}T00:00:00Z'"
+      },
+      "name": "Search Event Edit",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [2200, 150],
+      "credentials": { "googleCalendarOAuth2Api": { "name": "GoogleServiceAccount" } }
+    },
+    {
+      "parameters": {
+        "calendarId": "primary",
+        "eventId": "={{$json[\"eventId\"] || $json[\"id\"]}}",
+        "summary": "={{$json[\"title\"]}}",
+        "start": { "dateTime": "={{$json[\"date\"] + 'T' + $json[\"time\"] + ':00'}}" },
+        "end":   { "dateTime": "={{$moment($json[\"date\"] + 'T' + $json[\"time\"] + ':00').add(1,'hour').toISOString()}}"}
+      },
+      "name": "Update Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [2400, 150],
+      "credentials": { "googleCalendarOAuth2Api": { "name": "GoogleServiceAccount" } }
+    },
+    {
+      "parameters": {
+        "calendarId": "primary",
+        "filters": "summary = '{{$json[\"title\"]}}' AND startTime >= '{{$json[\"date\"]}}T00:00:00Z'"
+      },
+      "name": "Search Event Delete",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [2200, 300],
+      "credentials": { "googleCalendarOAuth2Api": { "name": "GoogleServiceAccount" } }
+    },
+    {
+      "parameters": {
+        "calendarId": "primary",
+        "eventId": "={{$json[\"eventId\"] || $json[\"id\"]}}"
+      },
+      "name": "Delete Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [2400, 300],
+      "credentials": { "googleCalendarOAuth2Api": { "name": "GoogleServiceAccount" } }
+    },
+    {
+      "parameters": {
+        "requestMethod": "POST",
+        "url": "https://graph.facebook.com/v14.0/{{$credentials.WhatsAppCloud.phoneId}}/messages",
+        "jsonParameters": true,
+        "bodyParametersUi": {
+          "parameter": [
+            { "name": "messaging_product","value":"whatsapp" },
+            { "name": "to",              "value":"={{$json[\"from\"]}}" },
+            { "name": "type",            "value":"text" },
+            {
+              "name": "text",
+              "value": { "body":"={{ 'Evento ' + $json['title'] + ( $json['action']==='add'?' creato':$json['action']==='edit'?' modificato':' cancellato') + ' con successo!' }}"}
+            }
+          ]
+        }
+      },
+      "name": "Send WhatsApp Response",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [2600, 150],
+      "credentials": { "httpRequest": { "name": "WhatsAppCloud" } }
+    },
+    {
+      "parameters": {},
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [1600, 300]
+    },
+    {
+      "parameters": { "waitTime": 30 },
+      "name": "Wait and Retry",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1800, 300]
+    }
+  ],
+  "connections": { /* ...stessi collegamenti del JSON precedente... */ },
+  "active": false,
+  "settings": {}
+}
